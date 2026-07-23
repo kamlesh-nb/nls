@@ -13,8 +13,14 @@ const lsp_kit = b.dependency("lsp_kit", .{}).module("lsp");
     });
     const llvm_mod = llvm_dep.module("llvm");
 
+    // nls reuses the Nova COMPILER's parser/analysis (it compiles the compiler's src/root.zig as the
+    // `compiler` module). That source lives in the `nova` repo — clone it as a SIBLING and nls builds
+    // by default (`../nova/src/root.zig`). A different layout (e.g. a mono-repo where the compiler
+    // folder is named `lang`) overrides the path: `zig build -Dnova-src=../lang/src/root.zig`.
+    const nova_src = b.option([]const u8, "nova-src", "Path to the Nova compiler's src/root.zig") orelse "../nova/src/root.zig";
+
     const lang_mod = b.createModule(.{
-        .root_source_file = b.path("../lang/src/root.zig"),
+        .root_source_file = b.path(nova_src),
         .target = target,
         .optimize = optimize,
         .imports = &.{
