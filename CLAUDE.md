@@ -61,8 +61,17 @@ afterwards to restore the host `nls` the editor launches.
 
 ## Implemented capabilities
 
-completion · hover · go-to-definition · document symbols · signature help · diagnostics ,  verified e2e
-over LSP stdio.
+completion · hover · go-to-definition · document symbols · signature help · diagnostics · references ·
+rename (+ prepareRename) · code actions · semantic tokens · workspace symbols ,  verified e2e over LSP stdio.
+
+**References and rename are binding-accurate for function-locals**: when the cursor sits on a parameter or a
+`let`/`const`, both confine their edits to the enclosing function's brace-matched extent (in that one file),
+so renaming a local `x` never touches a same-named local in another function or a global. For names that are
+NOT function-locals (globals, types, functions, fields, methods, enum variants) they fall back to the
+cross-file whole-word, string/comment-aware match, which is correct for a single-binding name. `braceMatchEnd`
+is used instead of `span.end` because the parser's end spans are unreliable (see Gotchas). Code actions
+currently cover the async await/spawn fix and the 128-bit-integer removal (replace with `long`/`i64`); the
+set is keyed on stable checker message substrings and is easy to extend.
 
 ## Gotchas
 

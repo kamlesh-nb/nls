@@ -1096,9 +1096,19 @@ pub const Handler = struct {
         const word = getWordAtIndex(source, index) orelse return null;
 
         var locs = std.ArrayList(types.Location).empty;
-        // Whole-word, string/comment-aware textual match across every open file.
-        // This is intentionally scope-agnostic (a good baseline): it finds every
-        // use of the name, not only the ones that bind to the same declaration.
+
+        // Binding-accurate for function-locals: if the cursor word is a parameter or a `let`/`const` in the
+        // enclosing function, confine references to that function's extent in THIS file only, so a local
+        // never picks up a same-named local elsewhere or a global.
+        if (try self.localBindingScope(arena, source, params.textDocument.uri, index, word)) |scope| {
+            var ranges = std.ArrayList(types.Range).empty;
+            try collectWordRangesBounded(arena, source, word, scope.lo, scope.hi, &ranges);
+            for (ranges.items) |r| try locs.append(arena, .{ .uri = params.textDocument.uri, .range = r });
+            return try locs.toOwnedSlice(arena);
+        }
+
+        // Otherwise (globals, types, functions, fields, methods): whole-word, string/comment-aware textual
+        // match across every open file. Scope-agnostic, but correct for names with a single binding.
         var it = self.files.iterator();
         while (it.next()) |entry| {
             const file_uri = entry.key_ptr.*;
@@ -1135,9 +1145,21 @@ pub const Handler = struct {
         const index = lsp.offsets.positionToIndex(source, params.position, self.offset_encoding);
         const word = getWordAtIndex(source, index) orelse return null;
 
-        // One TextEdit per whole-word occurrence, grouped by file into a
-        // WorkspaceEdit `changes` map. Same scope-agnostic match as references.
         var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+
+        // Binding-accurate for function-locals: rename only within the enclosing function's extent in this
+        // file, matching the references handler. A local rename must not spill into another scope.
+        if (try self.localBindingScope(arena, source, params.textDocument.uri, index, word)) |scope| {
+            var ranges = std.ArrayList(types.Range).empty;
+            try collectWordRangesBounded(arena, source, word, scope.lo, scope.hi, &ranges);
+            if (ranges.items.len == 0) return null;
+            var edits = try arena.alloc(types.TextEdit, ranges.items.len);
+            for (ranges.items, 0..) |r, i| edits[i] = .{ .range = r, .newText = params.newName };
+            try changes.map.put(arena, params.textDocument.uri, edits);
+            return .{ .changes = changes };
+        }
+
+        // Otherwise: one TextEdit per whole-word occurrence across every open file.
         var it = self.files.iterator();
         while (it.next()) |entry| {
             const file_uri = entry.key_ptr.*;
@@ -1173,8 +1195,37 @@ pub const Handler = struct {
                 try actions.append(arena, self.insertActionFor(arena, uri, diag.range, "await ", "Add 'await' to the async call", true) catch continue);
                 try actions.append(arena, self.insertActionFor(arena, uri, diag.range, "spawn ", "Run the async call with 'spawn'", false) catch continue);
             }
+            // The 128-bit integer type was removed; the checker names both replacements. Offer each as a
+            // range-replacing quick fix over the flagged type token.
+            if (std.mem.indexOf(u8, diag.message, "128-bit integer' was removed") != null) {
+                try actions.append(arena, self.replaceActionFor(arena, uri, diag.range, "long", "Replace with 'long'", true) catch continue);
+                try actions.append(arena, self.replaceActionFor(arena, uri, diag.range, "i64", "Replace with 'i64'", false) catch continue);
+            }
         }
         return try actions.toOwnedSlice(arena);
+    }
+
+    /// Build a quick-fix CodeAction that REPLACES `range` with `text`.
+    fn replaceActionFor(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        range: types.Range,
+        text: []const u8,
+        title: []const u8,
+        preferred: bool,
+    ) !types.CodeAction.Result {
+        _ = self;
+        const edits = try arena.alloc(types.TextEdit, 1);
+        edits[0] = .{ .range = range, .newText = text };
+        var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+        try changes.map.put(arena, uri, edits);
+        return .{ .code_action = .{
+            .title = title,
+            .kind = .quickfix,
+            .isPreferred = preferred,
+            .edit = .{ .changes = changes },
+        } };
     }
 
     /// Build a quick-fix CodeAction that inserts `text` at the start of `range`.
@@ -1425,6 +1476,127 @@ pub const Handler = struct {
             }
             i += 1;
         }
+    }
+
+    /// Like collectWordRanges but only emits matches whose start byte falls in [lo, hi). Used to confine a
+    /// local binding's references/rename to its enclosing function, so renaming a local `x` never touches a
+    /// same-named local in another function or a global `x`.
+    fn collectWordRangesBounded(arena: std.mem.Allocator, source: []const u8, word: []const u8, lo: usize, hi: usize, out: *std.ArrayList(types.Range)) !void {
+        if (word.len == 0) return;
+        var i: usize = lo;
+        while (i < hi) {
+            const c = source[i];
+            if (c == '/' and i + 1 < source.len and source[i + 1] == '/') {
+                while (i < source.len and source[i] != '\n') i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < source.len and source[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) i += 1;
+                i = @min(i + 2, source.len);
+                continue;
+            }
+            if (c == '"' or c == '`' or c == '\'') {
+                const quote = c;
+                i += 1;
+                while (i < source.len and source[i] != quote) {
+                    if (source[i] == '\\') i += 1;
+                    i += 1;
+                }
+                i = @min(i + 1, source.len);
+                continue;
+            }
+            if (std.ascii.isAlphabetic(c) or c == '_') {
+                const start = i;
+                while (i < source.len and (std.ascii.isAlphanumeric(source[i]) or source[i] == '_')) i += 1;
+                if (start < hi and std.mem.eql(u8, source[start..i], word)) {
+                    try out.append(arena, .{
+                        .start = lsp.offsets.indexToPosition(source, start, .@"utf-16"),
+                        .end = lsp.offsets.indexToPosition(source, i, .@"utf-16"),
+                    });
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Byte offset just past the matching `}` of the first `{` at or after `from`, skipping braces inside
+    /// strings, char literals, and comments. `span.end` is documented unreliable, so brace-match instead to
+    /// get a function's reliable extent. Returns null if no balanced body is found.
+    fn braceMatchEnd(source: []const u8, from: usize) ?usize {
+        var i: usize = from;
+        // Advance to the opening brace.
+        while (i < source.len and source[i] != '{') : (i += 1) {
+            const c = source[i];
+            if (c == '/' and i + 1 < source.len and source[i + 1] == '/') {
+                while (i < source.len and source[i] != '\n') i += 1;
+                if (i >= source.len) return null;
+            } else if (c == '"' or c == '`' or c == '\'') {
+                const q = c;
+                i += 1;
+                while (i < source.len and source[i] != q) : (i += 1) {
+                    if (source[i] == '\\') i += 1;
+                }
+            }
+        }
+        if (i >= source.len) return null;
+        var depth: usize = 0;
+        while (i < source.len) {
+            const c = source[i];
+            if (c == '/' and i + 1 < source.len and source[i + 1] == '/') {
+                while (i < source.len and source[i] != '\n') i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < source.len and source[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) i += 1;
+                i = @min(i + 2, source.len);
+                continue;
+            }
+            if (c == '"' or c == '`' or c == '\'') {
+                const q = c;
+                i += 1;
+                while (i < source.len and source[i] != q) {
+                    if (source[i] == '\\') i += 1;
+                    i += 1;
+                }
+                i = @min(i + 1, source.len);
+                continue;
+            }
+            if (c == '{') depth += 1;
+            if (c == '}') {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    /// If the word at `index` binds to a function-LOCAL (a parameter or a `let`/`const` in the enclosing
+    /// function), return the [lo, hi) byte extent of that function so references/rename can be confined to
+    /// it. Returns null for anything that is not a function-local -- globals, types, functions, fields,
+    /// methods, enum variants -- which keep the cross-file whole-word behaviour.
+    fn localBindingScope(self: *Handler, arena: std.mem.Allocator, source: []const u8, uri: []const u8, index: usize, word: []const u8) !?struct { lo: usize, hi: usize } {
+        _ = self;
+        var p = parser.Parser.init(arena, source, uri, false) catch return null;
+        defer p.deinit();
+        const program = p.parseProgram() catch return null;
+        const enc = analysis.enclosingFunction(program, index) orelse return null;
+        var locals = std.ArrayList(analysis.Local).empty;
+        try analysis.collectLocals(arena, program, enc, index, &locals);
+        var is_local = false;
+        for (locals.items) |l| {
+            if (std.mem.eql(u8, l.name, word)) {
+                is_local = true;
+                break;
+            }
+        }
+        if (!is_local) return null;
+        const lo = enc.decl.span.start;
+        const hi = braceMatchEnd(source, lo) orelse source.len;
+        return .{ .lo = lo, .hi = hi };
     }
 
     // A hyphen is part of a word only when it sits BETWEEN two identifier characters, so a hypermedia
@@ -1770,6 +1942,50 @@ test "rename edits every whole-word occurrence, skipping strings and comments" {
     const edits = res.?.changes.?.map.get(uri).?;
     // The declaration and the `return count;` use, but not the comment or string.
     try std.testing.expectEqual(@as(usize, 2), edits.len);
+}
+
+test "rename of a function-local is confined to its function (binding-accurate)" {
+    const allocator = std.testing.allocator;
+    var handler = Handler.init(allocator, undefined, undefined);
+    defer handler.deinit();
+
+    // Two functions each with their OWN local `x`. Renaming one must not touch the other.
+    const source =
+        \\fn a(): int {
+        \\    let x = 1;
+        \\    return x + x;
+        \\}
+        \\fn b(): int {
+        \\    let x = 2;
+        \\    return x;
+        \\}
+    ;
+    const uri = "file:///m.nova";
+    try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
+
+    // Cursor on the `x` binding inside `a` (its first occurrence).
+    const at = std.mem.indexOf(u8, source, "let x").? + 4;
+    const pos = lsp.offsets.indexToPosition(source, at, handler.offset_encoding);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try handler.@"textDocument/rename"(arena, .{
+        .textDocument = .{ .uri = uri },
+        .position = pos,
+        .newName = "y",
+    });
+    try std.testing.expect(res != null);
+    const edits = res.?.changes.?.map.get(uri).?;
+    // `a` has three `x` occurrences (decl + two uses); `b`'s three must be untouched.
+    try std.testing.expectEqual(@as(usize, 3), edits.len);
+    // Every edit must fall before `fn b` (i.e. inside `a`).
+    const b_start = std.mem.indexOf(u8, source, "fn b").?;
+    const b_pos = lsp.offsets.indexToPosition(source, b_start, handler.offset_encoding);
+    for (edits) |e| {
+        try std.testing.expect(e.range.start.line < b_pos.line);
+    }
 }
 
 test "workspace symbol fuzzy-matches declarations" {
