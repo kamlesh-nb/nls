@@ -6,9 +6,26 @@ const compiler = @import("compiler");
 const parser = compiler.parser;
 const formatter = compiler.formatter;
 const ast = compiler.ast;
+const lexer = compiler.lexer;
+const type_checker = compiler.type_checker;
 const analysis = @import("analysis.zig");
 
 const CItem = lsp.types.completion.Item;
+
+/// The semantic-token legend advertised to the client. The INDEX of a name in
+/// this array is the token-type id emitted in the token stream, so the order is
+/// load-bearing: keep it in sync with `semanticTokenType`. All names are drawn
+/// from the standard LSP `SemanticTokenTypes` set so editors theme them.
+const semantic_token_types = [_][]const u8{
+    "keyword", // 0
+    "type", // 1
+    "function", // 2
+    "variable", // 3
+    "string", // 4
+    "number", // 5
+    "operator", // 6
+    "comment", // 7
+};
 
 pub const Handler = struct {
     allocator: std.mem.Allocator,
@@ -76,6 +93,17 @@ pub const Handler = struct {
             .definitionProvider = .{ .bool = true },
             .documentSymbolProvider = .{ .bool = true },
             .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
+            .referencesProvider = .{ .bool = true },
+            .renameProvider = .{ .rename_options = .{ .prepareProvider = true } },
+            .codeActionProvider = .{ .bool = true },
+            .workspaceSymbolProvider = .{ .bool = true },
+            .semanticTokensProvider = .{ .semantic_tokens_options = .{
+                .legend = .{
+                    .tokenTypes = &semantic_token_types,
+                    .tokenModifiers = &.{},
+                },
+                .full = .{ .bool = true },
+            } },
         };
 
         if (builtin.mode == .Debug) {
@@ -167,45 +195,91 @@ pub const Handler = struct {
     }
 
     fn runDiagnostics(self: *Handler, arena: std.mem.Allocator, uri: []const u8, source: []const u8) !void {
+        var diags = std.ArrayList(types.Diagnostic).empty;
+
         var p = parser.Parser.init(arena, source, uri, false) catch |err| {
             std.log.err("Parser init failed: {any}", .{err});
             return;
         };
         defer p.deinit();
 
-        _ = p.parseProgram() catch {
+        if (p.parseProgram()) |program| {
+            // The buffer parses, so hand it to the SAME type checker the compiler
+            // runs and surface every spanned error it produces (not just the first
+            // token). Single-file mode: imports aren't resolved, so the checker's
+            // cross-module checks (e.g. undefined-trait) are best-effort; every
+            // check it emits is decl-guarded, so this stays low on false positives.
+            try self.collectSemanticDiagnostics(arena, uri, source, program, &diags);
+        } else |_| {
+            // Didn't parse, so report the parser's single syntax error, as before.
             const err_token = p.tokens[@min(p.pos, p.tokens.len - 1)];
             const line = err_token.line - 1;
             const column = err_token.column - 1;
-
             const msg = try std.fmt.allocPrint(arena, "Syntax error: unexpected token '{s}'", .{err_token.lexeme});
-
-            const diag = types.Diagnostic{
+            try diags.append(arena, .{
                 .range = .{
                     .start = .{ .line = @intCast(line), .character = @intCast(column) },
                     .end = .{ .line = @intCast(line), .character = @intCast(column + err_token.lexeme.len) },
                 },
                 .severity = .Error,
+                .source = "nova",
                 .message = msg,
-            };
+            });
+        }
 
-            const diag_list = try arena.alloc(types.Diagnostic, 1);
-            diag_list[0] = diag;
-
-            const publish_params = types.PublishDiagnosticsParams{
-                .uri = uri,
-                .diagnostics = diag_list,
-            };
-            try self.transport.writeNotification(self.io, arena, "textDocument/publishDiagnostics", types.PublishDiagnosticsParams, publish_params, .{});
-            return;
-        };
-
-        // No errors, clear diagnostics
         const publish_params = types.PublishDiagnosticsParams{
             .uri = uri,
-            .diagnostics = &.{},
+            .diagnostics = diags.items,
         };
         try self.transport.writeNotification(self.io, arena, "textDocument/publishDiagnostics", types.PublishDiagnosticsParams, publish_params, .{});
+    }
+
+    /// Run the compiler's type checker over `program` and translate each of its
+    /// span-carrying diagnostics into an LSP `Diagnostic` for the current file.
+    fn collectSemanticDiagnostics(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        source: []const u8,
+        program: ast.Program,
+        out: *std.ArrayList(types.Diagnostic),
+    ) !void {
+        var file_sources = std.StringHashMap([]const u8).init(arena);
+        file_sources.put(uri, source) catch return;
+
+        var tc = type_checker.TypeChecker.init(arena, &file_sources);
+        tc.silent = true; // keep stderr clean; the errors come back structured
+        defer tc.deinit();
+
+        // `check` returns error.TypeCheckError when it finds problems; that is the
+        // expected path here. Any other failure just yields no diagnostics.
+        tc.check(program) catch {};
+
+        for (tc.structured.items) |d| {
+            if (!std.mem.eql(u8, d.file, uri)) continue;
+            try out.append(arena, .{
+                .range = self.diagRange(source, d),
+                .severity = .Error,
+                .source = "nova",
+                .message = try arena.dupe(u8, d.message),
+            });
+        }
+    }
+
+    /// Map a type-checker diagnostic's start offset onto an editor range. The
+    /// checker gives a reliable start (byte offset of the reported node); we widen
+    /// it over the identifier there so the squiggle covers a whole name, falling
+    /// back to a single character when the node doesn't begin on a word.
+    fn diagRange(self: *Handler, source: []const u8, d: type_checker.Diagnostic) types.Range {
+        const start_idx = @min(d.start, source.len);
+        var end_idx = start_idx;
+        while (end_idx < source.len and
+            (std.ascii.isAlphanumeric(source[end_idx]) or source[end_idx] == '_')) end_idx += 1;
+        if (end_idx == start_idx) end_idx = @min(start_idx + 1, source.len);
+        return .{
+            .start = lsp.offsets.indexToPosition(source, start_idx, self.offset_encoding),
+            .end = lsp.offsets.indexToPosition(source, end_idx, self.offset_encoding),
+        };
     }
 
     fn getDocumentEnd(text: []const u8) types.Position {
@@ -261,7 +335,7 @@ pub const Handler = struct {
     // ------------------------------------------------------------------
 
     const CompletionContext = union(enum) {
-        /// `receiver.` — the dotted segment chain BEFORE the trailing dot.
+        /// `receiver.` ,  the dotted segment chain BEFORE the trailing dot.
         member: []const []const u8,
         /// Typing a bare identifier.
         identifier,
@@ -312,8 +386,8 @@ pub const Handler = struct {
     }
 
     /// Blank the line containing `index` (spaces), keeping `{`/`}` so brace
-    /// nesting stays balanced. Same length as the input, so every byte offset —
-    /// and thus every AST span — is preserved.
+    /// nesting stays balanced. Same length as the input, so every byte offset , 
+    /// and thus every AST span ,  is preserved.
     fn repairLine(arena: std.mem.Allocator, source: []const u8, index: usize) ![]u8 {
         const buf = try arena.dupe(u8, source);
         var ls = @min(index, buf.len);
@@ -720,7 +794,7 @@ pub const Handler = struct {
         const index = lsp.offsets.positionToIndex(source, params.position, self.offset_encoding);
         const word = getWordAtIndex(source, index) orelse return null;
 
-        // Local binding in the enclosing function wins — jump to its declaration.
+        // Local binding in the enclosing function wins ,  jump to its declaration.
         {
             var p = parser.Parser.init(arena, source, params.textDocument.uri, false) catch null;
             if (p) |*pp| {
@@ -863,7 +937,7 @@ pub const Handler = struct {
                 ',' => if (depth == 0) {
                     commas += 1;
                 },
-                ';', '{', '}' => return null, // statement boundary — not in a call
+                ';', '{', '}' => return null, // statement boundary ,  not in a call
                 else => {},
             }
             i -= 1;
@@ -903,7 +977,7 @@ pub const Handler = struct {
             }
             return null;
         }
-        // `recv.method` — resolve the receiver chain (all but the last segment).
+        // `recv.method` ,  resolve the receiver chain (all but the last segment).
         const method_name = segments[segments.len - 1];
         const recv = analysis.resolveChain(segments[0 .. segments.len - 1], locals, enc, program) orelse return null;
         const decl = analysis.findTypeDecl(program, recv.type_name) orelse return null;
@@ -1009,8 +1083,363 @@ pub const Handler = struct {
     }
 
     // ------------------------------------------------------------------
+    // Find references
+    // ------------------------------------------------------------------
+
+    pub fn @"textDocument/references"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.ReferenceParams,
+    ) !?[]const types.Location {
+        const source = self.files.get(params.textDocument.uri) orelse return null;
+        const index = lsp.offsets.positionToIndex(source, params.position, self.offset_encoding);
+        const word = getWordAtIndex(source, index) orelse return null;
+
+        var locs = std.ArrayList(types.Location).empty;
+        // Whole-word, string/comment-aware textual match across every open file.
+        // This is intentionally scope-agnostic (a good baseline): it finds every
+        // use of the name, not only the ones that bind to the same declaration.
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            const file_uri = entry.key_ptr.*;
+            const file_source = entry.value_ptr.*;
+            var ranges = std.ArrayList(types.Range).empty;
+            try collectWordRanges(arena, file_source, word, &ranges);
+            for (ranges.items) |r| try locs.append(arena, .{ .uri = file_uri, .range = r });
+        }
+        return try locs.toOwnedSlice(arena);
+    }
+
+    // ------------------------------------------------------------------
+    // Rename (+ prepareRename)
+    // ------------------------------------------------------------------
+
+    pub fn @"textDocument/prepareRename"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.PrepareRenameParams,
+    ) !?types.PrepareRenameResult {
+        _ = arena;
+        const source = self.files.get(params.textDocument.uri) orelse return null;
+        const index = lsp.offsets.positionToIndex(source, params.position, self.offset_encoding);
+        const r = self.wordRangeAt(source, index) orelse return null;
+        return .{ .range = r };
+    }
+
+    pub fn @"textDocument/rename"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.RenameParams,
+    ) !?types.WorkspaceEdit {
+        const source = self.files.get(params.textDocument.uri) orelse return null;
+        const index = lsp.offsets.positionToIndex(source, params.position, self.offset_encoding);
+        const word = getWordAtIndex(source, index) orelse return null;
+
+        // One TextEdit per whole-word occurrence, grouped by file into a
+        // WorkspaceEdit `changes` map. Same scope-agnostic match as references.
+        var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            const file_uri = entry.key_ptr.*;
+            const file_source = entry.value_ptr.*;
+            var ranges = std.ArrayList(types.Range).empty;
+            try collectWordRanges(arena, file_source, word, &ranges);
+            if (ranges.items.len == 0) continue;
+            var edits = try arena.alloc(types.TextEdit, ranges.items.len);
+            for (ranges.items, 0..) |r, i| edits[i] = .{ .range = r, .newText = params.newName };
+            try changes.map.put(arena, file_uri, edits);
+        }
+        if (changes.map.count() == 0) return null;
+        return .{ .changes = changes };
+    }
+
+    // ------------------------------------------------------------------
+    // Code actions (quick fixes off published diagnostics)
+    // ------------------------------------------------------------------
+
+    pub fn @"textDocument/codeAction"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.CodeActionParams,
+    ) !?[]const types.CodeAction.Result {
+        const uri = params.textDocument.uri;
+        var actions = std.ArrayList(types.CodeAction.Result).empty;
+
+        for (params.context.diagnostics) |diag| {
+            // An async call used without `await`/`spawn`. The checker's message
+            // spells out both fixes, and both are a safe insertion at the call
+            // start, so offer them as two quick fixes.
+            if (std.mem.indexOf(u8, diag.message, "await'ed") != null) {
+                try actions.append(arena, self.insertActionFor(arena, uri, diag.range, "await ", "Add 'await' to the async call", true) catch continue);
+                try actions.append(arena, self.insertActionFor(arena, uri, diag.range, "spawn ", "Run the async call with 'spawn'", false) catch continue);
+            }
+        }
+        return try actions.toOwnedSlice(arena);
+    }
+
+    /// Build a quick-fix CodeAction that inserts `text` at the start of `range`.
+    fn insertActionFor(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        range: types.Range,
+        text: []const u8,
+        title: []const u8,
+        preferred: bool,
+    ) !types.CodeAction.Result {
+        _ = self;
+        const at = types.Range{ .start = range.start, .end = range.start };
+        const edits = try arena.alloc(types.TextEdit, 1);
+        edits[0] = .{ .range = at, .newText = text };
+        var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+        try changes.map.put(arena, uri, edits);
+        return .{ .code_action = .{
+            .title = title,
+            .kind = .quickfix,
+            .isPreferred = preferred,
+            .edit = .{ .changes = changes },
+        } };
+    }
+
+    // ------------------------------------------------------------------
+    // Semantic tokens (full document)
+    // ------------------------------------------------------------------
+
+    pub fn @"textDocument/semanticTokens/full"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensParams,
+    ) !?types.SemanticTokens {
+        const source = self.files.get(params.textDocument.uri) orelse return null;
+
+        // The parser lexes on init and keeps the whole token array (`p.tokens`),
+        // available even when parseProgram later fails, so a half-typed file still
+        // colours. A successful parse additionally seeds the type/function name
+        // sets used to upgrade a bare identifier's colour.
+        var p = parser.Parser.init(arena, source, params.textDocument.uri, false) catch return null;
+        defer p.deinit();
+
+        var type_names = std.StringHashMap(void).init(arena);
+        var fn_names = std.StringHashMap(void).init(arena);
+        if (p.parseProgram()) |program| {
+            for (program.declarations) |decl| switch (decl) {
+                .struct_decl => |sd| try type_names.put(sd.name, {}),
+                .enum_decl => |ed| try type_names.put(ed.name, {}),
+                .trait_decl => |td| try type_names.put(td.name, {}),
+                .fn_decl => |fd| try fn_names.put(fd.name, {}),
+                else => {},
+            };
+        } else |_| {}
+        const tokens = p.tokens;
+
+        var data = std.ArrayList(u32).empty;
+        var prev_line: u32 = 0;
+        var prev_char: u32 = 0;
+        for (tokens) |tok| {
+            const ttype = semanticTokenType(tok, &type_names, &fn_names) orelse continue;
+            if (tok.line == 0) continue;
+            const line: u32 = @intCast(tok.line - 1);
+            const char: u32 = @intCast(tok.column - 1);
+            const len: u32 = @intCast(tok.lexeme.len);
+            if (len == 0) continue;
+            const d_line = line - prev_line;
+            const d_char = if (d_line == 0) char - prev_char else char;
+            try data.append(arena, d_line);
+            try data.append(arena, d_char);
+            try data.append(arena, len);
+            try data.append(arena, ttype);
+            try data.append(arena, 0); // no modifiers
+            prev_line = line;
+            prev_char = char;
+        }
+        return .{ .data = try data.toOwnedSlice(arena) };
+    }
+
+    /// Classify a lexer token into a semantic-token-type id (index into
+    /// `semantic_token_types`), or null to leave it unhighlighted.
+    fn semanticTokenType(
+        tok: lexer.Token,
+        type_names: *std.StringHashMap(void),
+        fn_names: *std.StringHashMap(void),
+    ) ?u32 {
+        return switch (tok.type) {
+            .identifier => blk: {
+                if (type_names.contains(tok.lexeme)) break :blk 1; // type
+                if (fn_names.contains(tok.lexeme)) break :blk 2; // function
+                break :blk 3; // variable
+            },
+            .string, .template_string, .interpolated_string, .char_literal => 4, // string
+            .integer, .float, .decimal => 5, // number
+            .bool_true, .bool_false => 0, // keyword-like
+            else => |t| if (isKeywordToken(t)) 0 else null,
+        };
+    }
+
+    fn isKeywordToken(t: lexer.TokenType) bool {
+        return switch (t) {
+            .keyword_fn, .keyword_async, .keyword_await, .keyword_spawn, .keyword_extern,
+            .keyword_struct, .keyword_class, .keyword_import, .keyword_trait, .keyword_impl,
+            .keyword_return, .keyword_let, .keyword_defer, .keyword_errdefer, .keyword_break,
+            .keyword_continue, .keyword_if, .keyword_else, .keyword_while, .keyword_for,
+            .keyword_switch, .keyword_case, .keyword_default, .keyword_try, .keyword_catch,
+            .keyword_throw, .keyword_match, .keyword_const, .keyword_export, .keyword_enum,
+            .keyword_pub, .keyword_var, .keyword_union => true,
+            else => false,
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Workspace symbols (project-wide search)
+    // ------------------------------------------------------------------
+
+    pub fn @"workspace/symbol"(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        params: types.WorkspaceSymbolParams,
+    ) !?types.WorkspaceSymbol.Result {
+        var syms = std.ArrayList(types.WorkspaceSymbol).empty;
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            const file_uri = entry.key_ptr.*;
+            const file_source = entry.value_ptr.*;
+            var p = parser.Parser.init(arena, file_source, file_uri, false) catch continue;
+            defer p.deinit();
+            const program = p.parseProgram() catch continue;
+            for (program.declarations) |decl| {
+                switch (decl) {
+                    .fn_decl => |fd| try appendWorkspaceSymbol(arena, &syms, params.query, file_uri, file_source, fd.name, .Function, fd.span, null),
+                    .const_decl => |cd| try appendWorkspaceSymbol(arena, &syms, params.query, file_uri, file_source, cd.name, .Constant, cd.span, null),
+                    .trait_decl => |td| try appendWorkspaceSymbol(arena, &syms, params.query, file_uri, file_source, td.name, .Interface, td.span, null),
+                    .struct_decl => |sd| {
+                        try appendWorkspaceSymbol(arena, &syms, params.query, file_uri, file_source, sd.name, .Struct, sd.span, null);
+                        for (sd.methods) |md| try appendWorkspaceSymbol(arena, &syms, params.query, file_uri, file_source, md.decl.name, if (md.is_static) .Function else .Method, md.decl.span, sd.name);
+                    },
+                    .enum_decl => |ed| {
+                        try appendWorkspaceSymbol(arena, &syms, params.query, file_uri, file_source, ed.name, .Enum, ed.span, null);
+                        for (ed.methods) |md| try appendWorkspaceSymbol(arena, &syms, params.query, file_uri, file_source, md.decl.name, if (md.is_static) .Function else .Method, md.decl.span, ed.name);
+                    },
+                    else => {},
+                }
+            }
+        }
+        return .{ .workspace_symbols = try syms.toOwnedSlice(arena) };
+    }
+
+    fn appendWorkspaceSymbol(
+        arena: std.mem.Allocator,
+        syms: *std.ArrayList(types.WorkspaceSymbol),
+        query: []const u8,
+        uri: []const u8,
+        source: []const u8,
+        name: []const u8,
+        kind: types.SymbolKind,
+        span: ast.Span,
+        container: ?[]const u8,
+    ) !void {
+        if (!fuzzyMatch(query, name)) return;
+        try syms.append(arena, .{
+            .name = name,
+            .kind = kind,
+            .containerName = container,
+            .location = .{ .location = .{ .uri = uri, .range = nameRange(source, span, name) } },
+        });
+    }
+
+    /// Relaxed subsequence match (case-insensitive), the matching a workspace
+    /// symbol query is meant to use. An empty query matches everything.
+    fn fuzzyMatch(query: []const u8, candidate: []const u8) bool {
+        if (query.len == 0) return true;
+        var qi: usize = 0;
+        for (candidate) |c| {
+            if (qi >= query.len) break;
+            if (std.ascii.toLower(c) == std.ascii.toLower(query[qi])) qi += 1;
+        }
+        return qi == query.len;
+    }
+
+    // ------------------------------------------------------------------
     // Shared helpers
     // ------------------------------------------------------------------
+
+    /// The identifier range covering `index`, or null if `index` isn't on a word.
+    fn wordRangeAt(self: *Handler, source: []const u8, index: usize) ?types.Range {
+        if (index > source.len) return null;
+        var start = index;
+        while (start > 0 and isWordByte(source, start - 1)) start -= 1;
+        var end = index;
+        while (end < source.len and isWordByte(source, end)) end += 1;
+        if (start == end) return null;
+        return .{
+            .start = lsp.offsets.indexToPosition(source, start, self.offset_encoding),
+            .end = lsp.offsets.indexToPosition(source, end, self.offset_encoding),
+        };
+    }
+
+    fn isWordByte(source: []const u8, i: usize) bool {
+        const c = source[i];
+        return std.ascii.isAlphanumeric(c) or c == '_' or (c == '-' and interiorHyphen(source, i));
+    }
+
+    /// Append the range of every whole-identifier occurrence of `word` in
+    /// `source`, skipping matches inside string literals and comments so a rename
+    /// never rewrites text or a `// foo` mention.
+    fn collectWordRanges(arena: std.mem.Allocator, source: []const u8, word: []const u8, out: *std.ArrayList(types.Range)) !void {
+        if (word.len == 0) return;
+        var i: usize = 0;
+        while (i < source.len) {
+            const c = source[i];
+            // Skip line comments.
+            if (c == '/' and i + 1 < source.len and source[i + 1] == '/') {
+                while (i < source.len and source[i] != '\n') i += 1;
+                continue;
+            }
+            // Skip block comments.
+            if (c == '/' and i + 1 < source.len and source[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) i += 1;
+                i = @min(i + 2, source.len);
+                continue;
+            }
+            // Skip string / template / char literals.
+            if (c == '"' or c == '`' or c == '\'') {
+                const quote = c;
+                i += 1;
+                while (i < source.len and source[i] != quote) {
+                    if (source[i] == '\\') i += 1;
+                    i += 1;
+                }
+                i = @min(i + 1, source.len);
+                continue;
+            }
+            // Identifier run.
+            if (std.ascii.isAlphabetic(c) or c == '_') {
+                const start = i;
+                while (i < source.len and (std.ascii.isAlphanumeric(source[i]) or source[i] == '_')) i += 1;
+                if (std.mem.eql(u8, source[start..i], word)) {
+                    try out.append(arena, .{
+                        .start = lsp.offsets.indexToPosition(source, start, .@"utf-16"),
+                        .end = lsp.offsets.indexToPosition(source, i, .@"utf-16"),
+                    });
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    // A hyphen is part of a word only when it sits BETWEEN two identifier characters, so a hypermedia
+    // attribute name (data-on-click, hx-get) is captured whole while a subtraction `a - b` is not.
+    fn interiorHyphen(source: []const u8, i: usize) bool {
+        if (i == 0 or i + 1 >= source.len) return false;
+        const prev = source[i - 1];
+        const next = source[i + 1];
+        const ok = struct {
+            fn f(c: u8) bool {
+                return std.ascii.isAlphanumeric(c) or c == '_';
+            }
+        }.f;
+        return ok(prev) and ok(next);
+    }
 
     fn getWordAtIndex(source: []const u8, index: usize) ?[]const u8 {
         if (index > source.len) return null;
@@ -1018,7 +1447,7 @@ pub const Handler = struct {
         var start = index;
         while (start > 0) {
             const c = source[start - 1];
-            if (std.ascii.isAlphanumeric(c) or c == '_') {
+            if (std.ascii.isAlphanumeric(c) or c == '_' or (c == '-' and interiorHyphen(source, start - 1))) {
                 start -= 1;
             } else {
                 break;
@@ -1028,7 +1457,7 @@ pub const Handler = struct {
         var end = index;
         while (end < source.len) {
             const c = source[end];
-            if (std.ascii.isAlphanumeric(c) or c == '_') {
+            if (std.ascii.isAlphanumeric(c) or c == '_' or (c == '-' and interiorHyphen(source, end))) {
                 end += 1;
             } else {
                 break;
@@ -1082,9 +1511,17 @@ pub const Handler = struct {
 
     /// The LSP Range covering the whole declaration span.
     fn fullRange(source: []const u8, span: ast.Span) types.Range {
+        const lo = @min(span.start, source.len);
+        // span.end is unreliable for the LAST declaration in a file: its body-closing token's span
+        // derives from the EOF lexeme, a static "" at offset 0, so span.end comes back as 0 (i.e.
+        // BEFORE span.start). An inverted range, or a selectionRange not contained in it ,  makes the
+        // VS Code client reject the WHOLE documentSymbol response ("Request documentSymbol failed"),
+        // which fires on every file because every file has a last declaration. Fall back to end-of-file
+        // (the final declaration does run to EOF), matching how nameRange guards the same span.end.
+        const hi = if (span.end > span.start) @min(span.end, source.len) else source.len;
         return .{
-            .start = lsp.offsets.indexToPosition(source, @min(span.start, source.len), .@"utf-16"),
-            .end = lsp.offsets.indexToPosition(source, @min(span.end, source.len), .@"utf-16"),
+            .start = lsp.offsets.indexToPosition(source, lo, .@"utf-16"),
+            .end = lsp.offsets.indexToPosition(source, hi, .@"utf-16"),
         };
     }
 
@@ -1095,7 +1532,7 @@ pub const Handler = struct {
         // span.end is unreliable for a declaration whose body-closing token is the
         // last in the file (its span derives from an EOF lexeme at offset 0). When
         // it's missing or behind the start, scan a bounded forward window from the
-        // declaration start — the name always appears on the first line or two.
+        // declaration start ,  the name always appears on the first line or two.
         const hi = if (span.end > span.start) @min(span.end, source.len) else @min(source.len, lo + 200);
         if (lo < hi) {
             if (std.mem.indexOfPos(u8, source[0..hi], lo, name)) |pos| {
@@ -1266,6 +1703,98 @@ test "Hover documentation comments" {
 
     const hover_val2 = hover_res2.?.contents.markup_content.value;
     try std.testing.expect(std.mem.indexOf(u8, hover_val2, "Wait cooperatively for the next file modification event.") != null);
+}
+
+test "semantic diagnostics surface type-checker errors" {
+    const allocator = std.testing.allocator;
+    var handler = Handler.init(allocator, undefined, undefined);
+    defer handler.deinit();
+
+    // Two functions of the same name in one module is a type-checker error
+    // (Nova has no overloading). The parser accepts it; the checker rejects it.
+    const source =
+        \\fn dup(): int { return 1; }
+        \\fn dup(): int { return 2; }
+    ;
+    const uri = "file:///m.nova";
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var p = try parser.Parser.init(arena, source, uri, false);
+    defer p.deinit();
+    const program = try p.parseProgram();
+
+    var diags = std.ArrayList(types.Diagnostic).empty;
+    try handler.collectSemanticDiagnostics(arena, uri, source, program, &diags);
+
+    try std.testing.expect(diags.items.len >= 1);
+    var saw_dup = false;
+    for (diags.items) |d| {
+        if (std.mem.indexOf(u8, d.message, "duplicate function") != null) saw_dup = true;
+    }
+    try std.testing.expect(saw_dup);
+}
+
+test "rename edits every whole-word occurrence, skipping strings and comments" {
+    const allocator = std.testing.allocator;
+    var handler = Handler.init(allocator, undefined, undefined);
+    defer handler.deinit();
+
+    const source =
+        \\fn total(): int {
+        \\    let count = 1;
+        \\    // count here is a comment mention
+        \\    let s = "count in a string";
+        \\    return count;
+        \\}
+    ;
+    const uri = "file:///m.nova";
+    try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
+
+    // Cursor on the `count` binding.
+    const at = std.mem.indexOf(u8, source, "count").?;
+    const pos = lsp.offsets.indexToPosition(source, at, handler.offset_encoding);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try handler.@"textDocument/rename"(arena, .{
+        .textDocument = .{ .uri = uri },
+        .position = pos,
+        .newName = "amount",
+    });
+    try std.testing.expect(res != null);
+    const edits = res.?.changes.?.map.get(uri).?;
+    // The declaration and the `return count;` use, but not the comment or string.
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+}
+
+test "workspace symbol fuzzy-matches declarations" {
+    const allocator = std.testing.allocator;
+    var handler = Handler.init(allocator, undefined, undefined);
+    defer handler.deinit();
+
+    const source =
+        \\struct HttpServer { pub port: int }
+        \\fn handleRequest() {}
+    ;
+    const uri = "file:///m.nova";
+    try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try handler.@"workspace/symbol"(arena, .{ .query = "hs" });
+    try std.testing.expect(res != null);
+    var saw_server = false;
+    for (res.?.workspace_symbols) |s| {
+        if (std.mem.eql(u8, s.name, "HttpServer")) saw_server = true;
+    }
+    try std.testing.expect(saw_server);
 }
 
 test "member completion resolves receiver type" {
