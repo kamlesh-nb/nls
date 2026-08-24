@@ -9,6 +9,8 @@ const ast = compiler.ast;
 const lexer = compiler.lexer;
 const type_checker = compiler.type_checker;
 const analysis = @import("analysis.zig");
+const resolve = @import("resolve.zig");
+const Io = std.Io;
 
 const CItem = lsp.types.completion.Item;
 
@@ -33,6 +35,10 @@ pub const Handler = struct {
     transport: *lsp.Transport,
     files: std.StringHashMapUnmanaged([]u8),
     offset_encoding: lsp.offsets.Encoding,
+    /// The user's home directory (for locating `~/.nova/std`), set by `main`
+    /// from the process environment. Null in unit tests, which keeps diagnostics
+    /// in single-file mode (no disk reads) so they run without a live `io`.
+    home: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, transport: *lsp.Transport) Handler {
         return .{
@@ -41,6 +47,7 @@ pub const Handler = struct {
             .transport = transport,
             .files = .empty,
             .offset_encoding = .@"utf-16",
+            .home = null,
         };
     }
 
@@ -247,16 +254,98 @@ pub const Handler = struct {
         var file_sources = std.StringHashMap([]const u8).init(arena);
         file_sources.put(uri, source) catch return;
 
+        // Start the merged declaration set with the open buffer's own decls, then
+        // fold in the transitive import closure so the checker sees the same
+        // symbols the real build does. Nova resolves types in one global merged
+        // namespace, so a feature file's `impl RequestHandler<...>` is only valid
+        // because the app entry (`main.nova`) pulls the framework in; type-checking
+        // the open file alone flagged every imported type/trait the compiler never
+        // does.
+        var decls = std.ArrayList(ast.Declaration).empty;
+        for (program.declarations) |d| decls.append(arena, d) catch {};
+
+        var have_imports = false;
+        var any_unresolved = false;
+        var loaded_project = false;
+
+        // Disk resolution only runs on the real server (`home` set). Unit tests
+        // pass a null home and an undefined `io`, so they stay in single-file mode.
+        if (self.home) |home| {
+            const base_path = resolve.uriToPath(arena, uri) catch uri;
+
+            var visited = std.StringHashMap(void).init(arena);
+            // The open buffer is already merged and keyed under `uri`; mark its
+            // path visited so the closure never re-reads a stale on-disk copy.
+            visited.put(base_path, {}) catch {};
+
+            // Work queue of file paths still to load. Seed it with the open
+            // buffer's own imports, plus the project entry so framework-level
+            // declarations (auto-discovered handlers rely on them) come into scope.
+            var work = std.ArrayList([]const u8).empty;
+            for (program.declarations) |d| {
+                if (d != .import_decl) continue;
+                if (std.mem.eql(u8, d.import_decl.module, "bytes")) continue;
+                have_imports = true;
+                if (resolve.resolveImport(arena, self.io, base_path, d.import_decl.module, home)) |rp| {
+                    work.append(arena, rp) catch {};
+                } else any_unresolved = true;
+            }
+            if (resolve.projectEntry(arena, self.io, base_path)) |entry| {
+                loaded_project = true;
+                if (!std.mem.eql(u8, entry, base_path)) work.append(arena, entry) catch {};
+            }
+
+            // Breadth-first over the closure. Each file's imports resolve relative
+            // to that file. A generous cap guards against pathological graphs.
+            var loaded: usize = 0;
+            while (work.pop()) |path| {
+                if (visited.contains(path)) continue;
+                visited.put(path, {}) catch {};
+
+                const fsrc = Io.Dir.readFileAlloc(.cwd(), self.io, path, arena, .unlimited) catch {
+                    any_unresolved = true;
+                    continue;
+                };
+                file_sources.put(path, fsrc) catch {};
+
+                var fp = parser.Parser.init(arena, fsrc, path, false) catch continue;
+                defer fp.deinit();
+                const fprog = fp.parseProgram() catch continue;
+                for (fprog.declarations) |fd| decls.append(arena, fd) catch {};
+
+                for (fprog.declarations) |fd| {
+                    if (fd != .import_decl) continue;
+                    if (std.mem.eql(u8, fd.import_decl.module, "bytes")) continue;
+                    if (resolve.resolveImport(arena, self.io, path, fd.import_decl.module, home)) |rp| {
+                        if (!visited.contains(rp)) work.append(arena, rp) catch {};
+                    } else any_unresolved = true;
+                }
+
+                loaded += 1;
+                if (loaded > 2000) break;
+            }
+        }
+
+        const merged = ast.Program{ .declarations = decls.items, .span = program.span };
+
         var tc = type_checker.TypeChecker.init(arena, &file_sources);
         tc.silent = true; // keep stderr clean; the errors come back structured
         defer tc.deinit();
 
         // `check` returns error.TypeCheckError when it finds problems; that is the
         // expected path here. Any other failure just yields no diagnostics.
-        tc.check(program) catch {};
+        tc.check(merged) catch {};
+
+        // When we loaded the project's full closure the checker is authoritative,
+        // so every diagnostic stands and genuine typos surface. Only for a loose
+        // file outside any project, where an unresolved import might legitimately
+        // define the symbol we are about to call unknown, do we drop the
+        // cross-module diagnostics rather than cry wolf.
+        const suppress_xmod = have_imports and any_unresolved and !loaded_project;
 
         for (tc.structured.items) |d| {
             if (!std.mem.eql(u8, d.file, uri)) continue;
+            if (suppress_xmod and resolve.isCrossModuleDiag(d.message)) continue;
             try out.append(arena, .{
                 .range = self.diagRange(source, d),
                 .severity = .Error,
