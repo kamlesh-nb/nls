@@ -902,7 +902,9 @@ pub const Handler = struct {
             }
         }
 
-        // Otherwise search every open file for the declaration.
+        // Otherwise search every open file for the declaration (the word's own
+        // definition), remembering the first hit as the primary target.
+        var primary: ?types.Location = null;
         var it = self.files.iterator();
         while (it.next()) |entry| {
             const file_uri = entry.key_ptr.*;
@@ -911,9 +913,34 @@ pub const Handler = struct {
             defer p.deinit();
             const program = p.parseProgram() catch continue;
             if (declSpanFor(program, word)) |span| {
-                return locationResult(arena, file_source, file_uri, span, word);
+                primary = .{ .uri = file_uri, .range = nameRange(file_source, span, word) };
+                break;
             }
         }
+
+        // Anti-magic navigation: if `word` is a command type served by one or more
+        // `RequestHandler<word, _>` implementations, surface those handlers. So
+        // go-to-definition on `Register` in a route (`app.post<Register>`) or a
+        // registration (`handlers.add<Register, RegisterHandler>`) reaches
+        // `RegisterHandler`, instead of the route-to-handler link being invisible.
+        // The command's own definition is kept first when it is among the open
+        // buffers, so if you have the command file open you get both (a peek list
+        // in VS Code); otherwise the result is just the handler, and the editor
+        // jumps straight to it, which is exactly what you want from a routing file.
+        var handler_locs = std.ArrayList(types.Location).empty;
+        // Gate the (potentially whole-project) handler search to files that
+        // actually route or register, so ordinary go-to-definition stays cheap.
+        if (fileRoutesOrRegisters(source)) {
+            self.collectHandlerLocations(arena, params.textDocument.uri, source, word, &handler_locs) catch {};
+        }
+        if (handler_locs.items.len > 0) {
+            var all = std.ArrayList(types.Location).empty;
+            if (primary) |p| try all.append(arena, p);
+            for (handler_locs.items) |h| try all.append(arena, h);
+            return .{ .definition = .{ .locations = try all.toOwnedSlice(arena) } };
+        }
+
+        if (primary) |p| return .{ .definition = .{ .location = p } };
         return null;
     }
 
@@ -937,6 +964,126 @@ pub const Handler = struct {
             }
         }
         return null;
+    }
+
+    /// Cheap gate: does this file route (`app.post<...>`, `get`/`put`/`delete`/
+    /// `patch`) or register handlers (`.add<...>`)? Only such files (typically the
+    /// app entry `main.nova`) benefit from the command-to-handler jump, so the
+    /// whole-project handler search is skipped everywhere else and ordinary
+    /// go-to-definition pays nothing.
+    fn fileRoutesOrRegisters(source: []const u8) bool {
+        const needles = [_][]const u8{ ".post<", ".get<", ".put<", ".delete<", ".patch<", ".add<" };
+        for (needles) |n| {
+            if (std.mem.indexOf(u8, source, n) != null) return true;
+        }
+        return false;
+    }
+
+    /// True if struct `sd` implements `RequestHandler<cmd, _>`, i.e. it is the
+    /// request handler that serves the command type named `cmd`. This is the link
+    /// go-to-definition follows from a route (`app.post<Register>`) or a
+    /// registration (`handlers.add<Register, RegisterHandler>`) to the handler.
+    fn structHandlesCommand(sd: ast.StructDecl, cmd: []const u8) bool {
+        for (sd.impls) |im| {
+            if (!std.mem.eql(u8, im.name, "RequestHandler")) continue;
+            if (im.type_args.len == 0) continue;
+            const first = analysis.typeRefName(im.type_args[0]) orelse continue;
+            if (std.mem.eql(u8, first, cmd)) return true;
+        }
+        return false;
+    }
+
+    /// Appends, for every `struct Y impl RequestHandler<cmd, _>` found in `program`,
+    /// a `Location` at `Y`'s name. `seen` dedupes by handler type name so the same
+    /// handler is not reported once per open buffer and once from disk.
+    fn scanHandlersInProgram(
+        arena: std.mem.Allocator,
+        program: ast.Program,
+        source: []const u8,
+        uri: []const u8,
+        cmd: []const u8,
+        out: *std.ArrayList(types.Location),
+        seen: *std.StringHashMap(void),
+    ) !void {
+        for (program.declarations) |decl| {
+            if (decl != .struct_decl) continue;
+            const sd = decl.struct_decl;
+            if (!structHandlesCommand(sd, cmd)) continue;
+            if (seen.contains(sd.name)) continue;
+            try seen.put(sd.name, {});
+            try out.append(arena, .{ .uri = uri, .range = nameRange(source, sd.span, sd.name) });
+        }
+    }
+
+    /// Collects the handler(s) that serve the command type named `cmd`, across
+    /// open buffers and the transitive import closure on disk (handler files are
+    /// usually not open when the cursor sits on a route in `main.nova`). This is
+    /// what makes `app.post<Register>` navigable straight to `RegisterHandler`.
+    fn collectHandlerLocations(
+        self: *Handler,
+        arena: std.mem.Allocator,
+        base_uri: []const u8,
+        base_source: []const u8,
+        cmd: []const u8,
+        out: *std.ArrayList(types.Location),
+    ) !void {
+        var seen = std.StringHashMap(void).init(arena);
+
+        // Open buffers first: they hold the freshest, possibly-unsaved source.
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            var p = parser.Parser.init(arena, entry.value_ptr.*, entry.key_ptr.*, false) catch continue;
+            defer p.deinit();
+            const program = p.parseProgram() catch continue;
+            try scanHandlersInProgram(arena, program, entry.value_ptr.*, entry.key_ptr.*, cmd, out, &seen);
+        }
+
+        // Then the import closure from disk. Only runs on the real server (home
+        // set); unit tests pass a null home and stay in open-buffer mode.
+        const home = self.home orelse return;
+        const base_path = resolve.uriToPath(arena, base_uri) catch return;
+
+        var visited = std.StringHashMap(void).init(arena);
+        visited.put(base_path, {}) catch {};
+
+        var work = std.ArrayList([]const u8).empty;
+        var bp = parser.Parser.init(arena, base_source, base_path, false) catch return;
+        defer bp.deinit();
+        const bprog = bp.parseProgram() catch return;
+        for (bprog.declarations) |d| {
+            if (d != .import_decl) continue;
+            if (std.mem.eql(u8, d.import_decl.module, "bytes")) continue;
+            if (resolve.resolveImport(arena, self.io, base_path, d.import_decl.module, home)) |rp| {
+                work.append(arena, rp) catch {};
+            }
+        }
+        if (resolve.projectEntry(arena, self.io, base_path)) |entry| {
+            if (!std.mem.eql(u8, entry, base_path)) work.append(arena, entry) catch {};
+        }
+
+        var loaded: usize = 0;
+        while (work.pop()) |path| {
+            if (visited.contains(path)) continue;
+            visited.put(path, {}) catch {};
+            loaded += 1;
+            if (loaded > 4000) break;
+
+            const fsrc = Io.Dir.readFileAlloc(.cwd(), self.io, path, arena, .unlimited) catch continue;
+            var fp = parser.Parser.init(arena, fsrc, path, false) catch continue;
+            defer fp.deinit();
+            const fprog = fp.parseProgram() catch continue;
+
+            const furi = resolve.pathToUri(arena, path) catch path;
+            try scanHandlersInProgram(arena, fprog, fsrc, furi, cmd, out, &seen);
+
+            for (fprog.declarations) |fd| {
+                if (fd != .import_decl) continue;
+                if (std.mem.eql(u8, fd.import_decl.module, "bytes")) continue;
+                if (resolve.resolveImport(arena, self.io, path, fd.import_decl.module, home)) |rp| {
+                    if (!visited.contains(rp)) work.append(arena, rp) catch {};
+                }
+            }
+        }
     }
 
     /// Build a Definition result pointing at `word` within `span` (the name's
@@ -2232,4 +2379,46 @@ test "go to definition finds a function span" {
     const loc = res.?.definition.location;
     // The definition is the `target` on line 0, not the call on line 1.
     try std.testing.expectEqual(@as(u32, 0), loc.range.start.line);
+}
+
+test "go to definition on a command type also surfaces its RequestHandler" {
+    const allocator = std.testing.allocator;
+    var handler = Handler.init(allocator, undefined, undefined);
+    defer handler.deinit();
+
+    // The command and its route live in one file; the handler in another. Both
+    // are open buffers (home is null in tests, so only the open-buffer path runs).
+    const main_src =
+        \\struct Register { email: string, init() { self.email = ""; } }
+        \\fn build(app: App) { app.post<Register>("/register"); }
+    ;
+    const handler_src =
+        \\struct RegisterHandler impl RequestHandler<Register, Response> {
+        \\    init() {}
+        \\    async fn handle(self: RegisterHandler, c: Register): Response { return ok(); }
+        \\}
+    ;
+    const main_uri = "file:///main.nova";
+    const handler_uri = "file:///handler.nova";
+    try handler.files.put(allocator, try allocator.dupe(u8, main_uri), try allocator.dupe(u8, main_src));
+    try handler.files.put(allocator, try allocator.dupe(u8, handler_uri), try allocator.dupe(u8, handler_src));
+
+    // Cursor on `Register` inside the route `app.post<Register>`.
+    const at = std.mem.indexOf(u8, main_src, "post<Register>").? + "post<".len;
+    const pos = lsp.offsets.indexToPosition(main_src, at, handler.offset_encoding);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try handler.@"textDocument/definition"(arena, .{ .textDocument = .{ .uri = main_uri }, .position = pos });
+    try std.testing.expect(res != null);
+    // Multiple results: the command definition plus the handler that serves it.
+    const locs = res.?.definition.locations;
+    try std.testing.expect(locs.len >= 2);
+    var saw_handler = false;
+    for (locs) |l| {
+        if (std.mem.eql(u8, l.uri, handler_uri)) saw_handler = true;
+    }
+    try std.testing.expect(saw_handler);
 }

@@ -55,6 +55,17 @@ pub fn uriToPath(alloc: std.mem.Allocator, uri: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Inverse of `uriToPath` for absolute paths: prepend the `file://` scheme so a
+/// disk path can be handed back to the client as a `Location.uri`. Kept simple
+/// (no percent-encoding, since project paths do not contain characters that need
+/// escaping); a Windows drive-letter path gets the extra slash (`file:///C:/...`).
+pub fn pathToUri(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':') {
+        return std.fmt.allocPrint(alloc, "file:///{s}", .{path});
+    }
+    return std.fmt.allocPrint(alloc, "file://{s}", .{path});
+}
+
 /// True if `path` names an existing regular file (or anything `statFile` can stat).
 fn exists(io: Io, path: []const u8) bool {
     _ = Io.Dir.statFile(.cwd(), io, path, .{}) catch return false;
