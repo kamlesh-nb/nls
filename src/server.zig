@@ -35,7 +35,7 @@ pub const Handler = struct {
     transport: *lsp.Transport,
     files: std.StringHashMapUnmanaged([]u8),
     offset_encoding: lsp.offsets.Encoding,
-    /// The user's home directory (for locating `~/.nova/std`), set by `main`
+    /// The user's home directory (for locating `~/.kyte/std`), set by `main`
     /// from the process environment. Null in unit tests, which keeps diagnostics
     /// in single-file mode (no disk reads) so they run without a live `io`.
     home: ?[]const u8 = null,
@@ -119,7 +119,7 @@ pub const Handler = struct {
 
         return .{
             .serverInfo = .{
-                .name = "Nova Language Server",
+                .name = "Kyte Language Server",
                 .version = "0.2.0",
             },
             .capabilities = server_capabilities,
@@ -229,7 +229,7 @@ pub const Handler = struct {
                     .end = .{ .line = @intCast(line), .character = @intCast(column + err_token.lexeme.len) },
                 },
                 .severity = .Error,
-                .source = "nova",
+                .source = "kyte",
                 .message = msg,
             });
         }
@@ -256,9 +256,9 @@ pub const Handler = struct {
 
         // Start the merged declaration set with the open buffer's own decls, then
         // fold in the transitive import closure so the checker sees the same
-        // symbols the real build does. Nova resolves types in one global merged
+        // symbols the real build does. Kyte resolves types in one global merged
         // namespace, so a feature file's `impl RequestHandler<...>` is only valid
-        // because the app entry (`main.nova`) pulls the framework in; type-checking
+        // because the app entry (`main.ky`) pulls the framework in; type-checking
         // the open file alone flagged every imported type/trait the compiler never
         // does.
         var decls = std.ArrayList(ast.Declaration).empty;
@@ -349,7 +349,7 @@ pub const Handler = struct {
             try out.append(arena, .{
                 .range = self.diagRange(source, d),
                 .severity = .Error,
-                .source = "nova",
+                .source = "kyte",
                 .message = try arena.dupe(u8, d.message),
             });
         }
@@ -739,7 +739,7 @@ pub const Handler = struct {
         // Builtin type keyword?
         for (analysis.primitive_types) |t| {
             if (std.mem.eql(u8, t, hovered_word)) {
-                return markdownHover(arena, try std.fmt.allocPrint(arena, "```nova\n{s}\n```\nNova builtin primitive type.", .{t}));
+                return markdownHover(arena, try std.fmt.allocPrint(arena, "```kyte\n{s}\n```\nKyte builtin primitive type.", .{t}));
             }
         }
 
@@ -758,9 +758,9 @@ pub const Handler = struct {
                             if (!std.mem.eql(u8, l.name, hovered_word)) continue;
                             const kind = if (l.is_param) "param" else if (l.is_const) "const" else "let";
                             const body = if (l.type_name) |t|
-                                try std.fmt.allocPrint(arena, "```nova\n{s} {s}: {s}\n```", .{ kind, l.name, t })
+                                try std.fmt.allocPrint(arena, "```kyte\n{s} {s}: {s}\n```", .{ kind, l.name, t })
                             else
-                                try std.fmt.allocPrint(arena, "```nova\n{s} {s}\n```", .{ kind, l.name });
+                                try std.fmt.allocPrint(arena, "```kyte\n{s} {s}\n```", .{ kind, l.name });
                             return markdownHover(arena, body);
                         }
                     }
@@ -853,10 +853,10 @@ pub const Handler = struct {
         return null;
     }
 
-    /// Hover rendering a `nova` code fence plus any `///` doc comment above `start`.
+    /// Hover rendering a `kyte` code fence plus any `///` doc comment above `start`.
     fn codeHover(arena: std.mem.Allocator, source: []const u8, sig: []const u8, start: usize) !?types.Hover {
         var md = std.ArrayList(u8).empty;
-        try md.appendSlice(arena, "```nova\n");
+        try md.appendSlice(arena, "```kyte\n");
         try md.appendSlice(arena, sig);
         try md.appendSlice(arena, "\n```\n");
         if (try getDocComment(source, start, arena)) |doc| {
@@ -968,7 +968,7 @@ pub const Handler = struct {
 
     /// Cheap gate: does this file route (`app.post<...>`, `get`/`put`/`delete`/
     /// `patch`) or register handlers (`.add<...>`)? Only such files (typically the
-    /// app entry `main.nova`) benefit from the command-to-handler jump, so the
+    /// app entry `main.ky`) benefit from the command-to-handler jump, so the
     /// whole-project handler search is skipped everywhere else and ordinary
     /// go-to-definition pays nothing.
     fn fileRoutesOrRegisters(source: []const u8) bool {
@@ -1017,7 +1017,7 @@ pub const Handler = struct {
 
     /// Collects the handler(s) that serve the command type named `cmd`, across
     /// open buffers and the transitive import closure on disk (handler files are
-    /// usually not open when the cursor sits on a route in `main.nova`). This is
+    /// usually not open when the cursor sits on a route in `main.ky`). This is
     /// what makes `app.post<Register>` navigable straight to `RegisterHandler`.
     fn collectHandlerLocations(
         self: *Handler,
@@ -2081,7 +2081,7 @@ test "Hover documentation comments" {
         \\}
     ;
 
-    const uri = "file:///mock.nova";
+    const uri = "file:///mock.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     const init_index = std.mem.indexOf(u8, source, "init").?;
@@ -2119,12 +2119,12 @@ test "semantic diagnostics surface type-checker errors" {
     defer handler.deinit();
 
     // Two functions of the same name in one module is a type-checker error
-    // (Nova has no overloading). The parser accepts it; the checker rejects it.
+    // (Kyte has no overloading). The parser accepts it; the checker rejects it.
     const source =
         \\fn dup(): int { return 1; }
         \\fn dup(): int { return 2; }
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2158,7 +2158,7 @@ test "rename edits every whole-word occurrence, skipping strings and comments" {
         \\    return count;
         \\}
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     // Cursor on the `count` binding.
@@ -2196,7 +2196,7 @@ test "rename of a function-local is confined to its function (binding-accurate)"
         \\    return x;
         \\}
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     // Cursor on the `x` binding inside `a` (its first occurrence).
@@ -2233,7 +2233,7 @@ test "workspace symbol fuzzy-matches declarations" {
         \\struct HttpServer { pub port: int }
         \\fn handleRequest() {}
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2266,7 +2266,7 @@ test "member completion resolves receiver type" {
         \\    c.
         \\}
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     const dot = std.mem.indexOf(u8, source, "c.").? + 2;
@@ -2303,7 +2303,7 @@ test "identifier completion offers top-level symbols and locals" {
         \\    t
         \\}
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     const at = std.mem.indexOf(u8, source, "    t\n").? + 5;
@@ -2335,7 +2335,7 @@ test "signature help reports params and active index" {
         \\fn add(a: int, b: int): int { return a + b; }
         \\fn main() { let s = add(1, 2); }
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     // Cursor after the comma → second argument (active index 1).
@@ -2364,7 +2364,7 @@ test "go to definition finds a function span" {
         \\fn target(): int { return 42; }
         \\fn caller() { let x = target(); }
     ;
-    const uri = "file:///m.nova";
+    const uri = "file:///m.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, uri), try allocator.dupe(u8, source));
 
     const use = std.mem.indexOf(u8, source, "target()").?;
@@ -2398,8 +2398,8 @@ test "go to definition on a command type also surfaces its RequestHandler" {
         \\    async fn handle(self: RegisterHandler, c: Register): Response { return ok(); }
         \\}
     ;
-    const main_uri = "file:///main.nova";
-    const handler_uri = "file:///handler.nova";
+    const main_uri = "file:///main.ky";
+    const handler_uri = "file:///handler.ky";
     try handler.files.put(allocator, try allocator.dupe(u8, main_uri), try allocator.dupe(u8, main_src));
     try handler.files.put(allocator, try allocator.dupe(u8, handler_uri), try allocator.dupe(u8, handler_src));
 

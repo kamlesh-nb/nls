@@ -1,7 +1,7 @@
 .{
-    .name = .nls,
+    .name = .kynalyzer,
     .version = "0.1.0",
-    .fingerprint = 0xbd4c3b155aad433a,
+    .fingerprint = 0x26137d05215705ec,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .lsp_kit = .{

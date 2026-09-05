@@ -3,18 +3,18 @@
 //! The single-file type checker only ever saw the open buffer, so every symbol
 //! reached through an `import` (a repository's `Db`, a view's `OrderView`, a
 //! `List`, a `Service` trait) looked undefined and produced a red squiggle that
-//! the compiler never emits. This module maps a Nova `import a.b.c` (stored in
-//! the AST with `/` separators, e.g. `a/b/c`) to a concrete `.nova`/`.nsx` file
+//! the compiler never emits. This module maps a Kyte `import a.b.c` (stored in
+//! the AST with `/` separators, e.g. `a/b/c`) to a concrete `.ky`/`.nsx` file
 //! on disk, so the diagnostics pass can merge those files' declarations and run
 //! the checker over the same set the real build sees.
 //!
 //! It is a deliberately trimmed cousin of the compiler's `resolveImportPath`
 //! (in `pipeline.zig`): it covers the two cases every project hits, the standard
-//! library under `~/.nova/std` and project-relative modules, plus a best-effort
+//! library under `~/.kyte/std` and project-relative modules, plus a best-effort
 //! scan of a sibling `packages/` directory. Anything it cannot place is reported
 //! as unresolved so the caller can stay conservative rather than invent an error.
 //! Keeping it here (rather than importing the compiler's version) is what lets
-//! nls stay a pure-Zig, LLVM-free binary.
+//! kynalyzer stay a pure-Zig, LLVM-free binary.
 
 const std = @import("std");
 const Io = std.Io;
@@ -72,7 +72,7 @@ fn exists(io: Io, path: []const u8) bool {
     return true;
 }
 
-/// Allocate `dir + "/" + rest + ".nova"` (and, on a second call, `.nsx`) and
+/// Allocate `dir + "/" + rest + ".ky"` (and, on a second call, `.nsx`) and
 /// return it if it exists on disk, else free it and return null.
 fn tryFile(alloc: std.mem.Allocator, io: Io, comptime fmt: []const u8, args: anytype) ?[]u8 {
     const path = std.fmt.allocPrint(alloc, fmt, args) catch return null;
@@ -104,7 +104,7 @@ fn stdAlias(module: []const u8) ?[]const u8 {
 
 /// Resolve one import `module` (a `/`-separated path) referenced from the file
 /// at `base_path`, returning an owned absolute path to the backing file, or null
-/// if it cannot be located. `home` is the user's home directory (for `~/.nova`).
+/// if it cannot be located. `home` is the user's home directory (for `~/.kyte`).
 pub fn resolveImport(
     alloc: std.mem.Allocator,
     io: Io,
@@ -112,26 +112,26 @@ pub fn resolveImport(
     module: []const u8,
     home: ?[]const u8,
 ) ?[]u8 {
-    // 1. Standard library under ~/.nova/std.
+    // 1. Standard library under ~/.kyte/std.
     if (home) |h| {
-        if (tryFile(alloc, io, "{s}/.nova/std/{s}.nova", .{ h, module })) |p| return p;
+        if (tryFile(alloc, io, "{s}/.kyte/std/{s}.ky", .{ h, module })) |p| return p;
         if (std.mem.startsWith(u8, module, "std/")) {
-            if (tryFile(alloc, io, "{s}/.nova/std/{s}.nova", .{ h, module[4..] })) |p| return p;
+            if (tryFile(alloc, io, "{s}/.kyte/std/{s}.ky", .{ h, module[4..] })) |p| return p;
         }
         if (stdAlias(module)) |aliased| {
-            if (tryFile(alloc, io, "{s}/.nova/std/{s}.nova", .{ h, aliased })) |p| return p;
+            if (tryFile(alloc, io, "{s}/.kyte/std/{s}.ky", .{ h, aliased })) |p| return p;
         }
     }
 
     // 2. Project-relative: walk up the directory chain from the importing file,
-    //    trying `<dir>/src/<module>` then `<dir>/<module>`, as .nova then .nsx.
+    //    trying `<dir>/src/<module>` then `<dir>/<module>`, as .ky then .nsx.
     const dir_end = std.mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
     var cur_len = dir_end;
     while (true) {
         const cur = base_path[0..cur_len];
-        if (tryFile(alloc, io, "{s}/src/{s}.nova", .{ cur, module })) |p| return p;
+        if (tryFile(alloc, io, "{s}/src/{s}.ky", .{ cur, module })) |p| return p;
         if (tryFile(alloc, io, "{s}/src/{s}.nsx", .{ cur, module })) |p| return p;
-        if (tryFile(alloc, io, "{s}/{s}.nova", .{ cur, module })) |p| return p;
+        if (tryFile(alloc, io, "{s}/{s}.ky", .{ cur, module })) |p| return p;
         if (tryFile(alloc, io, "{s}/{s}.nsx", .{ cur, module })) |p| return p;
 
         const slash = std.mem.lastIndexOfScalar(u8, cur, '/') orelse break;
@@ -162,8 +162,8 @@ fn resolveFromPackages(alloc: std.mem.Allocator, io: Io, base_path: []const u8, 
             var it = Io.Dir.iterate(dir);
             while (it.next(io) catch null) |entry| {
                 if (entry.kind != .directory) continue;
-                if (tryFile(alloc, io, "{s}/{s}/src/{s}.nova", .{ packages_dir, entry.name, module })) |p| return p;
-                if (tryFile(alloc, io, "{s}/{s}/{s}.nova", .{ packages_dir, entry.name, module })) |p| return p;
+                if (tryFile(alloc, io, "{s}/{s}/src/{s}.ky", .{ packages_dir, entry.name, module })) |p| return p;
+                if (tryFile(alloc, io, "{s}/{s}/{s}.ky", .{ packages_dir, entry.name, module })) |p| return p;
             }
         } else |_| {}
 
@@ -176,7 +176,7 @@ fn resolveFromPackages(alloc: std.mem.Allocator, io: Io, base_path: []const u8, 
 
 /// Find the project's entry file. Walks up from the file at `base_path` looking
 /// for a directory that holds a `project.json`; if found and it has a
-/// `src/main.nova`, returns that path (owned). This is the root the compiler
+/// `src/main.ky`, returns that path (owned). This is the root the compiler
 /// compiles from, and whose transitive closure defines the whole app's symbols,
 /// including framework traits (e.g. `RequestHandler`) that individual feature
 /// files never import directly. Returns null if no project root is found.
@@ -188,7 +188,7 @@ pub fn projectEntry(alloc: std.mem.Allocator, io: Io, base_path: []const u8) ?[]
         const has_manifest = exists(io, manifest);
         alloc.free(manifest);
         if (has_manifest) {
-            if (tryFile(alloc, io, "{s}/src/main.nova", .{cur})) |p| return p;
+            if (tryFile(alloc, io, "{s}/src/main.ky", .{cur})) |p| return p;
             return null; // project root found but no conventional entry
         }
         const slash = std.mem.lastIndexOfScalar(u8, cur, '/') orelse break;

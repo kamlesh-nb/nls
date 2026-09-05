@@ -1,8 +1,8 @@
-//! analysis.zig — the semantic core of the Nova language server.
+//! analysis.zig — the semantic core of the Kyte language server.
 //!
 //! The LSP handlers (server.zig) are thin: they turn an LSP request into a
 //! cursor offset, call into here, and marshal the result back. Everything that
-//! needs to understand Nova code — resolving the type of a receiver, gathering
+//! needs to understand Kyte code — resolving the type of a receiver, gathering
 //! the locals in scope, finding where a name is declared — lives here so it can
 //! be unit-tested without a running transport.
 //!
@@ -17,7 +17,7 @@ const compiler = @import("compiler");
 const ast = compiler.ast;
 const parser = compiler.parser;
 
-/// The primitive type NAMES Nova recognises (kept in sync with
+/// The primitive type NAMES Kyte recognises (kept in sync with
 /// codegen/types.zig `cgPrim` + `isPrimitiveTypeName`). Used for hover on a
 /// type keyword and to seed identifier completion.
 pub const primitive_types = [_][]const u8{
@@ -27,7 +27,7 @@ pub const primitive_types = [_][]const u8{
     "ptr",    "void", "any",
 };
 
-/// Nova keywords offered in identifier-position completion.
+/// Kyte keywords offered in identifier-position completion.
 pub const keywords = [_][]const u8{
     "let",    "const",  "fn",     "struct", "enum",   "union",  "trait",  "impl",
     "import", "export", "pub",    "return", "if",     "else",   "while",  "for",

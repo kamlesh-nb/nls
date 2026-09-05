@@ -5,7 +5,7 @@ const lsp = @import("lsp");
 const server = @import("server.zig");
 
 pub fn main(init: std.process.Init) !void {
-    std.debug.print("NLS starting...\n", .{});
+    std.debug.print("KYNALYZER starting...\n", .{});
 
     const gpa = init.gpa;
     const io = init.io;
@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     const transport: *lsp.Transport = &stdio_transport.transport;
 
     var handler: server.Handler = server.Handler.init(gpa, io, transport);
-    // Locate ~/.nova/std so the diagnostics pass can resolve standard-library
+    // Locate ~/.kyte/std so the diagnostics pass can resolve standard-library
     // imports; borrowed from the process environment (lives for the whole run).
     handler.home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE");
     defer handler.deinit();

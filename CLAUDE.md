@@ -1,40 +1,40 @@
-# CLAUDE.md ,  nls (Nova Language Server)
+# CLAUDE.md ,  kynalyzer (Kyte Language Server)
 
 ## What this is
 
-**nls** is the **Language Server Protocol (LSP)** implementation for the **Nova** language, written in
-**Zig**. It gives editors (via the Nova VSCode **extension**, a separate repo) IDE features over Nova
+**kynalyzer** is the **Language Server Protocol (LSP)** implementation for the **Kyte** language, written in
+**Zig**. It gives editors (via the Kyte VSCode **extension**, a separate repo) IDE features over Kyte
 source: completion, hover, go-to-definition, document symbols, signature help, and diagnostics.
 
-It is a standalone LSP server (stdio transport). Nova (the `lang` repo) is the compiler; `nls` reuses
-Nova's lexer/parser-level understanding to answer LSP requests.
+It is a standalone LSP server (stdio transport). Kyte (the `lang` repo) is the compiler; `kynalyzer` reuses
+Kyte's lexer/parser-level understanding to answer LSP requests.
 
 ## Build / install / run
 
-**nls reuses the Nova COMPILER's parser/analysis** ,  its `build.zig` compiles the compiler's
-`src/root.zig` as the `compiler` module. So the **`nova` repo must be present as a sibling folder**:
+**kynalyzer reuses the Kyte COMPILER's parser/analysis** ,  its `build.zig` compiles the compiler's
+`src/root.zig` as the `compiler` module. So the **`kyte` repo must be present as a sibling folder**:
 
 ```bash
-# clone nova + nls side by side
+# clone kyte + kynalyzer side by side
 git clone https://github.com/kamlesh-nb/nova.git
 git clone https://github.com/kamlesh-nb/nls.git
-cd nls
-zig build                 # default: uses ../nova/src/root.zig; installs to $HOME/.nova/bin/nls
+cd kynalyzer
+zig build                 # default: uses ../kyte/src/root.zig; installs to $HOME/.kyte/bin/kynalyzer
 
 # If the compiler folder is named differently (e.g. a mono-repo where it's `lang/`), override:
-zig build -Dnova-src=../lang/src/root.zig
+zig build -Dkyte-src=../lang/src/root.zig
 ```
-The editor client (VS Code extension) launches `~/.nova/bin/nls` over stdio. nls only ever touches the
+The editor client (VS Code extension) launches `~/.kyte/bin/kynalyzer` over stdio. kynalyzer only ever touches the
 compiler's parser/formatter/ast/lexer (plus the sema modules it re-exports), none of which import `llvm`
 (only codegen does, and codegen is not reachable from the LSP). So the `build.zig` deliberately does NOT
-wire the `llvm` binding in: nls is a pure-Zig binary with no external link dependency, which is exactly
+wire the `llvm` binding in: kynalyzer is a pure-Zig binary with no external link dependency, which is exactly
 what lets it cross-compile to every OS/arch with the bundled Zig toolchain alone.
 
 ### Cross-compiling (host build matrix)
 
 Pass `-Dtarget=<triple>` to build one target (installs to `zig-out/bin`), or run `zig build cross` to
-build all six at once into `zig-out/cross/<triple>/` (`nls.exe` for Windows). Both work from any host
-(macOS, Windows, WSL/Linux). Keep `-Dnova-src=...` if the compiler folder is not `../nova`:
+build all six at once into `zig-out/cross/<triple>/` (`kynalyzer.exe` for Windows). Both work from any host
+(macOS, Windows, WSL/Linux). Keep `-Dkyte-src=...` if the compiler folder is not `../kyte`:
 
 ```bash
 zig build -Dtarget=x86_64-macos        # macOS x86_64 (intel)
@@ -47,8 +47,8 @@ zig build cross                        # all six at once (into zig-out/cross/<tr
 ```
 
 Note: a plain `-Dtarget=...` build still runs the default install step, which copies the (cross) binary
-over `~/.nova/bin/nls`. Prefer `zig build cross` for cross artefacts, and rebuild natively (`zig build`)
-afterwards to restore the host `nls` the editor launches.
+over `~/.kyte/bin/kynalyzer`. Prefer `zig build cross` for cross artefacts, and rebuild natively (`zig build`)
+afterwards to restore the host `kynalyzer` the editor launches.
 
 ## Layout (`src/`)
 
@@ -76,12 +76,12 @@ set is keyed on stable checker message substrings and is easy to extend.
 ## Gotchas
 
 - **Parser span reliability**: key IDE positioning off the **start** span (`span.start`); `span.end` has
-  been unreliable historically. Confirm against real Nova-compiled positions.
-- `zig build` **auto-installs** to `~/.nova/bin/nls`; the extension expects it there. Watch for a
+  been unreliable historically. Confirm against real Kyte-compiled positions.
+- `zig build` **auto-installs** to `~/.kyte/bin/kynalyzer`; the extension expects it there. Watch for a
   build-vs-launch race if you rebuild while an editor is connected.
 - Zig version: matches `build.zig.zon`.
 
-## Relationship to Nova
+## Relationship to Kyte
 
 Pairs with the `lang` repo (the compiler/language) and the `extension` repo (the VSCode client that
-spawns this server). Versions can move independently, but LSP features track Nova's syntax/semantics.
+spawns this server). Versions can move independently, but LSP features track Kyte's syntax/semantics.

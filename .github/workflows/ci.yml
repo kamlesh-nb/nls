@@ -1,12 +1,12 @@
 name: CI
 
-# nls (the Nova Language Server) is a pure-Zig binary with NO LLVM link and NO native runtime: it
-# compiles the Nova compiler's parser/analysis (src/root.zig) as a Zig module and answers LSP requests.
+# kynalyzer (the Kyte Language Server) is a pure-Zig binary with NO LLVM link and NO native runtime: it
+# compiles the Kyte compiler's parser/analysis (src/root.zig) as a Zig module and answers LSP requests.
 # That makes its CI far lighter than lang's -- no LLVM to install, and it cross-compiles to every
 # OS/arch from a single host with the bundled Zig toolchain alone.
 #
-# nls needs the `nova` (lang) repo checked out as a SIBLING so `-Dnova-src` can point at its
-# src/root.zig. If `nova` is private, set the NOVA_TOKEN secret to a PAT with read access (else the
+# kynalyzer needs the `kyte` (lang) repo checked out as a SIBLING so `-Dkyte-src` can point at its
+# src/root.zig. If `kyte` is private, set the KYTE_TOKEN secret to a PAT with read access (else the
 # checkout falls back to GITHUB_TOKEN, which works when both repos share an owner and it is permitted).
 #
 # NOTE on `zig build` vs `zig build test`: the DEFAULT `zig build` runs an install step that shells out
@@ -23,29 +23,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # One Linux host proves nls COMPILES for all six OS/arch -- the payoff of being LLVM-free.
+  # One Linux host proves kynalyzer COMPILES for all six OS/arch -- the payoff of being LLVM-free.
   cross-build:
     name: cross-build (all 6 targets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { path: nls }
+        with: { path: kynalyzer }
       - uses: actions/checkout@v4
         with:
           repository: kamlesh-nb/nova
           path: lang
-          token: ${{ secrets.NOVA_TOKEN || github.token }}
+          token: ${{ secrets.KYTE_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       - name: Cache Zig build cache
         uses: actions/cache@v4
         with:
-          path: nls/.zig-cache
-          key: zigcache-nls-cross-${{ hashFiles('nls/build.zig', 'nls/build.zig.zon', 'nls/src/**') }}
-          restore-keys: zigcache-nls-cross-
+          path: kynalyzer/.zig-cache
+          key: zigcache-kynalyzer-cross-${{ hashFiles('kynalyzer/build.zig', 'kynalyzer/build.zig.zon', 'kynalyzer/src/**') }}
+          restore-keys: zigcache-kynalyzer-cross-
       - name: zig build cross (aarch64/x86_64 x linux/macos/windows)
-        working-directory: nls
-        run: zig build cross -Dnova-src=../lang/src/root.zig
+        working-directory: kynalyzer
+        run: zig build cross -Dkyte-src=../lang/src/root.zig
 
   # Native hosts run the test suite. `zig build test` executes the tests on that OS/arch.
   test:
@@ -62,20 +62,20 @@ jobs:
           - { name: windows-x86_64, runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
-        with: { path: nls }
+        with: { path: kynalyzer }
       - uses: actions/checkout@v4
         with:
           repository: kamlesh-nb/nova
           path: lang
-          token: ${{ secrets.NOVA_TOKEN || github.token }}
+          token: ${{ secrets.KYTE_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       - name: Cache Zig build cache
         uses: actions/cache@v4
         with:
-          path: nls/.zig-cache
-          key: zigcache-nls-${{ matrix.name }}-${{ hashFiles('nls/build.zig', 'nls/build.zig.zon', 'nls/src/**') }}
-          restore-keys: zigcache-nls-${{ matrix.name }}-
+          path: kynalyzer/.zig-cache
+          key: zigcache-kynalyzer-${{ matrix.name }}-${{ hashFiles('kynalyzer/build.zig', 'kynalyzer/build.zig.zon', 'kynalyzer/src/**') }}
+          restore-keys: zigcache-kynalyzer-${{ matrix.name }}-
       - name: zig build test
-        working-directory: nls
-        run: zig build test -Dnova-src=../lang/src/root.zig
+        working-directory: kynalyzer
+        run: zig build test -Dkyte-src=../lang/src/root.zig
