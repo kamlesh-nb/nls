@@ -4,7 +4,7 @@
 //! reached through an `import` (a repository's `Db`, a view's `OrderView`, a
 //! `List`, a `Service` trait) looked undefined and produced a red squiggle that
 //! the compiler never emits. This module maps a Kyte `import a.b.c` (stored in
-//! the AST with `/` separators, e.g. `a/b/c`) to a concrete `.ky`/`.nsx` file
+//! the AST with `/` separators, e.g. `a/b/c`) to a concrete `.ky`/`.kyx` file
 //! on disk, so the diagnostics pass can merge those files' declarations and run
 //! the checker over the same set the real build sees.
 //!
@@ -72,7 +72,7 @@ fn exists(io: Io, path: []const u8) bool {
     return true;
 }
 
-/// Allocate `dir + "/" + rest + ".ky"` (and, on a second call, `.nsx`) and
+/// Allocate `dir + "/" + rest + ".ky"` (and, on a second call, `.kyx`) and
 /// return it if it exists on disk, else free it and return null.
 fn tryFile(alloc: std.mem.Allocator, io: Io, comptime fmt: []const u8, args: anytype) ?[]u8 {
     const path = std.fmt.allocPrint(alloc, fmt, args) catch return null;
@@ -124,15 +124,15 @@ pub fn resolveImport(
     }
 
     // 2. Project-relative: walk up the directory chain from the importing file,
-    //    trying `<dir>/src/<module>` then `<dir>/<module>`, as .ky then .nsx.
+    //    trying `<dir>/src/<module>` then `<dir>/<module>`, as .ky then .kyx.
     const dir_end = std.mem.lastIndexOfScalar(u8, base_path, '/') orelse 0;
     var cur_len = dir_end;
     while (true) {
         const cur = base_path[0..cur_len];
         if (tryFile(alloc, io, "{s}/src/{s}.ky", .{ cur, module })) |p| return p;
-        if (tryFile(alloc, io, "{s}/src/{s}.nsx", .{ cur, module })) |p| return p;
+        if (tryFile(alloc, io, "{s}/src/{s}.kyx", .{ cur, module })) |p| return p;
         if (tryFile(alloc, io, "{s}/{s}.ky", .{ cur, module })) |p| return p;
-        if (tryFile(alloc, io, "{s}/{s}.nsx", .{ cur, module })) |p| return p;
+        if (tryFile(alloc, io, "{s}/{s}.kyx", .{ cur, module })) |p| return p;
 
         const slash = std.mem.lastIndexOfScalar(u8, cur, '/') orelse break;
         if (slash == 0) break;
